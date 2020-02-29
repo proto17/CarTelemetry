@@ -6,6 +6,7 @@
 */
 
 #define F_CPU 16000000
+#define ADC_MAX_VAL 1024
 
 #include <avr/io.h>
 #include <util/delay.h>
@@ -315,6 +316,117 @@ void setup_pins(pin_t * const pins, const uint8_t pin_count) {
 	}
 }
 
+static inline void set_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
+	ptr |= (1 << bit_offset);
+}
+
+static inline void clear_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
+	ptr &= (~(0 << bit_offset));
+}
+
+static inline void set_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
+	*ptr |= (1 << bit_offset);
+}
+
+static inline void clear_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
+	*ptr &= (~(0 << bit_offset));
+}
+
+static inline void set_bit_val(volatile uint8_t & ptr, const uint8_t bit_offset, const bool value) {
+	if (value) {
+		set_bit(ptr, bit_offset);
+	} else {
+		clear_bit(ptr, bit_offset);
+	}
+}
+
+
+enum class ADC_External_Referece : uint8_t {
+	AREF = 0b00,
+	AVCC = 0b01,
+	Internal = 0b11
+};
+
+enum class ADC_LeftAdjust : uint8_t {
+	ALIGN_LEFT,
+	ALIGN_RIGHT
+};
+
+enum class ADC_Channel : uint8_t  {
+	ADC_0 = 0b000,
+	ADC_1 = 0b001,
+	ADC_2 = 0b010,
+	ADC_3 = 0b011,
+	ADC_4 = 0b100,
+	ADC_5 = 0b101,
+	ADC_6 = 0b110,
+	ADC_7 = 0b111,
+	ADC_INT_TEMP = 0b1000
+};
+
+enum class ADC_Prescaler : uint8_t {
+	DIVIDE_BY_2 = 0b000,
+	// Both 0b000 and 0b001 will divide the clock by 2
+	DIVIDE_BY_2_SECOND = 0b001,
+	DIVIDE_BY_4 = 0b010,
+	DIVIDE_BY_8 = 0b011,
+	DIVIDE_BY_16 = 0b100,
+	DIVIDE_BY_32 = 0b101,
+	DIVIDE_BY_64 = 0b110,
+	DIVIDE_BY_128 = 0b111
+};
+
+
+/************************************************************************/
+/* Reads from the specified analog input                                */
+/************************************************************************/
+uint16_t analog_read(const ADC_Channel & channel) {
+	ADMUX |= ((((uint8_t)channel) & 0xf) << MUX0);
+	ADCSRA |= (1 << ADSC);
+	while ((ADCSRA & (1 << ADSC)));
+	
+	return ADC;
+}
+
+/************************************************************************/
+/* Converts the value in analog_read() to volts                         */
+/************************************************************************/
+float analog_read_volts(const ADC_Channel & channel, const float vref=5.0f) {
+	return analog_read(channel) * (vref / ADC_MAX_VAL);
+}
+
+/************************************************************************/
+/* Reads pressure from the cheap Amazon/eBay 5 volt pressure sensors    */
+/* Returns value in millibar to avoid sending floats all over the place */
+/************************************************************************/
+uint32_t get_pressure_millibar(const ADC_Channel & analog_channel, const float max_pressure_bar) {
+	return static_cast<uint32_t>(analog_read(analog_channel) * (max_pressure_bar / ADC_MAX_VAL) * 100);
+}
+
+static void init_adc(const ADC_Prescaler & prescaler, const ADC_External_Referece & extern_ref, const ADC_LeftAdjust & left_adjust) {
+	ADMUX = 0x00;
+	
+	set_bit_val(ADMUX, REFS1, ((uint8_t)extern_ref) & 0b10);
+	set_bit_val(ADMUX, REFS0, ((uint8_t)extern_ref) & 0b01);
+	
+	set_bit_val(ADMUX, ADLAR, left_adjust == ADC_LeftAdjust::ALIGN_LEFT);
+	
+	ADCSRA = 0x00;
+	// Enable the ADC
+	set_bit(ADCSRA, ADEN);
+	// Clear the start conversion flag
+	clear_bit(ADCSRA, ADSC);
+	// Clear the auto trigger enable flag
+	clear_bit(ADCSRA, ADATE);
+	// Clear the interrupt enable flag
+	clear_bit(ADCSRA, ADIE);
+	
+	// Set the three bits of the prescaler
+	set_bit_val(ADCSRA, ADPS2, ((uint8_t)prescaler) & 0b100);
+	set_bit_val(ADCSRA, ADPS1, ((uint8_t)prescaler) & 0b010);
+	set_bit_val(ADCSRA, ADPS0, ((uint8_t)prescaler) & 0b001);	
+}
+
 
 const uint8_t PIN_COUNT = 3;
 pin_t pins[PIN_COUNT] = {
@@ -330,8 +442,11 @@ int main(void)
 	DDRC = 0xff;
 	init_serial(2000000);
 	uint8_t a = 0;
-	char buff[5];
+	char buff[7];
 	
+	// Initialize the ADC.  The input clock is 16 MHz, so the prescaler needs to knock the input clock waaayyy down
+	// and shift all the bits in the ADC data register to the LSB (most of the bits in the ADCL register)
+	init_adc(ADC_Prescaler::DIVIDE_BY_128, ADC_External_Referece::AREF, ADC_LeftAdjust::ALIGN_RIGHT);
 
 	if (! validate_pins(pins, PIN_COUNT)) {
 		//ACK
@@ -362,7 +477,7 @@ int main(void)
 				send_serial("LOST POWER\n");
 			} else {
 				send_serial("This is a test ");
-				itoa(a, buff, 10);
+				itoa(get_pressure_millibar(ADC_Channel::ADC_0, 30), buff, 10);
 				send_serial(buff);
 				send_serial("\n");
 				a++;
