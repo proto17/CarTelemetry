@@ -7,12 +7,75 @@
 
 #define F_CPU 16000000
 #define ADC_MAX_VAL 1024
+#define MILLIS_TIMER_MAX 2000
 
 #include <avr/io.h>
 #include <util/delay.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+
+static inline void set_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
+	ptr |= (1 << bit_offset);
+}
+
+static inline void clear_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
+	ptr &= (~(0 << bit_offset));
+}
+
+static inline void set_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
+	*ptr |= (1 << bit_offset);
+}
+
+static inline void clear_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
+	*ptr &= (~(0 << bit_offset));
+}
+
+static inline void set_bit_val(volatile uint8_t & ptr, const uint8_t bit_offset, const bool value) {
+	if (value) {
+		set_bit(ptr, bit_offset);
+		} else {
+		clear_bit(ptr, bit_offset);
+	}
+}
+
+static volatile uint64_t _milliseconds_since_startup = 0;
+
+static uint64_t millis() {
+	uint64_t milliseconds;
+	ATOMIC_BLOCK(ATOMIC_FORCEON) {
+		milliseconds = _milliseconds_since_startup;
+	}
+	return milliseconds;
+}
+
+static void setup_millis_timer() {
+	clear_bit(TCCR1A, COM1A1);
+	clear_bit(TCCR1A, COM1A0);
+	clear_bit(TCCR1A, WGM11);
+	clear_bit(TCCR1A, WGM10);
+	clear_bit(TCCR1B, WGM13);
+	set_bit(TCCR1B, WGM12);
+	clear_bit(TCCR1B, CS12);
+	set_bit(TCCR1B, CS11);
+	clear_bit(TCCR1B, CS10);
+	
+	OCR1AH = (MILLIS_TIMER_MAX >> 8);
+	OCR1AL = (MILLIS_TIMER_MAX & 0x00ff);
+	set_bit(TIMSK1, OCIE1A);
+	
+	sei();
+}
+
+ISR(TIMER1_COMPA_vect) {
+	OCR1AH = (MILLIS_TIMER_MAX >> 8);
+	OCR1AL = (MILLIS_TIMER_MAX & 0x00ff);
+	
+	_milliseconds_since_startup++;
+}
+
 
 // Define the pin direction possibilities
 enum class pin_dir {
@@ -101,7 +164,6 @@ static inline void send_serial(const char * data, const uint16_t data_len=0) {
 			idx++;
 		}
 	}
-	
 }
 
 struct pin_t {
@@ -316,31 +378,6 @@ void setup_pins(pin_t * const pins, const uint8_t pin_count) {
 	}
 }
 
-static inline void set_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
-	ptr |= (1 << bit_offset);
-}
-
-static inline void clear_bit(volatile uint8_t & ptr, const uint8_t bit_offset) {
-	ptr &= (~(0 << bit_offset));
-}
-
-static inline void set_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
-	*ptr |= (1 << bit_offset);
-}
-
-static inline void clear_bit(volatile uint8_t * const ptr, const uint8_t bit_offset) {
-	*ptr &= (~(0 << bit_offset));
-}
-
-static inline void set_bit_val(volatile uint8_t & ptr, const uint8_t bit_offset, const bool value) {
-	if (value) {
-		set_bit(ptr, bit_offset);
-	} else {
-		clear_bit(ptr, bit_offset);
-	}
-}
-
-
 enum class ADC_External_Referece : uint8_t {
 	AREF = 0b00,
 	AVCC = 0b01,
@@ -403,6 +440,9 @@ uint32_t get_pressure_millibar(const ADC_Channel & analog_channel, const float m
 	return static_cast<uint32_t>(analog_read(analog_channel) * (max_pressure_bar / ADC_MAX_VAL) * 100);
 }
 
+/************************************************************************/
+/* Initialize the analog to digital converter                           */
+/************************************************************************/
 static void init_adc(const ADC_Prescaler & prescaler, const ADC_External_Referece & extern_ref, const ADC_LeftAdjust & left_adjust) {
 	ADMUX = 0x00;
 	
@@ -427,11 +467,11 @@ static void init_adc(const ADC_Prescaler & prescaler, const ADC_External_Referec
 	set_bit_val(ADCSRA, ADPS0, ((uint8_t)prescaler) & 0b001);	
 }
 
-
 const uint8_t PIN_COUNT = 3;
 pin_t pins[PIN_COUNT] = {
 		{"C3"},
-		{"D2"}, {"D3"}
+		{"B0"},
+		{"D3"}
 };
 auto & led_pin = pins[0];
 auto & power_loss_input = pins[1];
@@ -442,11 +482,13 @@ int main(void)
 	DDRC = 0xff;
 	init_serial(2000000);
 	uint8_t a = 0;
-	char buff[7];
+	char buff[22];
 	
 	// Initialize the ADC.  The input clock is 16 MHz, so the prescaler needs to knock the input clock waaayyy down
 	// and shift all the bits in the ADC data register to the LSB (most of the bits in the ADCL register)
 	init_adc(ADC_Prescaler::DIVIDE_BY_128, ADC_External_Referece::AREF, ADC_LeftAdjust::ALIGN_RIGHT);
+	
+	setup_millis_timer();
 
 	if (! validate_pins(pins, PIN_COUNT)) {
 		//ACK
@@ -461,14 +503,16 @@ int main(void)
 		led2.write(true);
 		power_loss_input.set_dir(pin_dir::INPUT);
 		
-		DDRD &= (~(1 << PORTD2));
+		set_bit(DDRD, PORTD2);
 
 		while (1)
 		{
+			/*
 			led2.write(true);
 			_delay_ms(100);
 			led2.write(false);
 			_delay_ms(100);
+			*/
 			
 			const auto v = power_loss_input.read();
 			led_pin.write(v);
@@ -477,7 +521,9 @@ int main(void)
 				send_serial("LOST POWER\n");
 			} else {
 				send_serial("This is a test ");
-				itoa(get_pressure_millibar(ADC_Channel::ADC_0, 30), buff, 10);
+				
+				//itoa(get_pressure_millibar(ADC_Channel::ADC_0, 30), buff, 10);
+				ltoa(millis(), buff, 10);
 				send_serial(buff);
 				send_serial("\n");
 				a++;
